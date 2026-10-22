@@ -79,8 +79,6 @@ ok(r.status === 400, "wrong PKCE verifier rejected");
 r = await token({ client_id: dcr.client_id, grant_type: "authorization_code", code: a.location.searchParams.get("code"), code_verifier: a.verifier, redirect_uri: claudeRedirect, resource: `${base}/mcp` });
 const tokens = await r.json();
 ok(r.status === 200 && tokens.access_token && tokens.refresh_token, "tokens issued");
-r = await token({ client_id: dcr.client_id, grant_type: "authorization_code", code: a.location.searchParams.get("code"), code_verifier: a.verifier, redirect_uri: claudeRedirect });
-ok(r.status === 400, "authorization code is single-use");
 
 let m = await mcp(tokens.access_token, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "e2e", version: "1" } });
 ok(m.status === 200 && m.body.result.serverInfo.name === "agenthuman-ux", "initialize");
@@ -104,12 +102,48 @@ const rotated = await r.json();
 ok(r.status === 200 && rotated.access_token !== tokens.access_token, "refresh rotates tokens");
 m = await mcp(tokens.access_token, "tools/list", {});
 ok(m.status === 200, "old access token keeps working until it expires");
+r = await token({ client_id: "someone-else", grant_type: "refresh_token", refresh_token: rotated.refresh_token });
+ok(r.status === 400 || r.status === 401, "refresh token can't be used by another client");
 r = await token({ client_id: dcr.client_id, grant_type: "refresh_token", refresh_token: tokens.refresh_token });
 ok(r.status === 400, "reused refresh token rejected");
 m = await mcp(rotated.access_token, "tools/list", {});
-ok(m.status === 200, "reuse inside the retry grace window doesn't revoke the new tokens");
-r = await token({ client_id: "someone-else", grant_type: "refresh_token", refresh_token: rotated.refresh_token });
-ok(r.status === 400 || r.status === 401, "refresh token can't be used by another client");
+ok(m.status === 401, "refresh reuse revokes the whole grant (thief and victim both cut off)");
+r = await token({ client_id: dcr.client_id, grant_type: "refresh_token", refresh_token: rotated.refresh_token });
+ok(r.status === 400, "…including the newest refresh token");
+
+/** Fresh tokens for the DCR client. */
+async function connect() {
+  const res = await authorize({ clientId: dcr.client_id, redirectUri: claudeRedirect });
+  const code = res.location.searchParams.get("code");
+  const issued = await (await token({ client_id: dcr.client_id, grant_type: "authorization_code", code, code_verifier: res.verifier, redirect_uri: claudeRedirect })).json();
+  return { ...issued, code, verifier: res.verifier };
+}
+
+let fresh = await connect();
+r = await token({ client_id: dcr.client_id, grant_type: "authorization_code", code: fresh.code, code_verifier: fresh.verifier, redirect_uri: claudeRedirect });
+ok(r.status === 400, "authorization code is single-use");
+ok((await mcp(fresh.access_token, "tools/list", {})).status === 401, "replaying a code revokes the tokens it issued");
+
+fresh = await connect();
+r = await fetch(asm.revocation_endpoint, form({ client_id: "another-client", token: fresh.refresh_token }));
+ok((await mcp(fresh.access_token, "tools/list", {})).status === 200, "another client can't revoke your tokens");
+r = await fetch(asm.revocation_endpoint, form({ client_id: dcr.client_id, token: fresh.refresh_token }));
+ok(r.status === 200 && (await mcp(fresh.access_token, "tools/list", {})).status === 401, "revoking a refresh token ends the grant");
+
+fresh = await connect();
+let page = await (await fetch(`${base}/connections`, { headers: { cookie } })).text();
+const connectionIds = [...page.matchAll(/name="connectionId" value="([^"]+)"/g)].map((match) => match[1]);
+const listCsrf = /name="csrf" value="([^"]+)"/.exec(page)[1];
+ok(page.includes("Connected apps") && connectionIds.length >= 1, "connections page lists connected apps");
+r = await fetch(`${base}/connections/disconnect`, { ...form({ connectionId: connectionIds.at(-1), csrf: "x".repeat(listCsrf.length) }), headers: { cookie, "content-type": "application/x-www-form-urlencoded" } });
+ok(r.status === 403, "disconnect requires the CSRF token");
+for (const connectionId of connectionIds) {
+  await fetch(`${base}/connections/disconnect`, { ...form({ connectionId, csrf: listCsrf }), headers: { cookie, "content-type": "application/x-www-form-urlencoded" } });
+}
+ok((await mcp(fresh.access_token, "tools/list", {})).status === 401, "Disconnect revokes access immediately");
+
+r = await fetch(`${base}/login`, form({ email: "x@example.com", next: "/\\evil.example" }));
+ok(r.headers.get("location") === "/", "login `next` can't redirect off-site (/\\evil)");
 
 // ── Edge cases every client can hit ──────────────────────────────────────────
 a = await authorize({ clientId: dcr.client_id, redirectUri: claudeRedirect, resource: null });
@@ -119,10 +153,10 @@ m = await mcp(noResource.access_token, "tools/list", {});
 ok(m.status === 200, "client that omits `resource` still gets a working token");
 
 a = await authorize({ clientId: dcr.client_id, redirectUri: claudeRedirect, resource: "https://evil.example/mcp" });
-ok(a.location.searchParams.get("error") === "invalid_target" && a.location.searchParams.get("iss") === asm.issuer, "foreign `resource` rejected (with iss)");
+ok(a.status === 400, "foreign `resource` rejected; unverified client gets an error page, not a redirect");
 
 a = await authorize({ clientId: dcr.client_id, redirectUri: claudeRedirect, scope: "admin:everything" });
-ok(a.location.searchParams.get("error") === "invalid_scope", "only-unknown scopes rejected");
+ok(a.status === 400, "only-unknown scopes rejected (no open redirect for unverified clients)");
 
 a = await authorize({ clientId: dcr.client_id, redirectUri: claudeRedirect, decision: "deny" });
 ok(a.location.searchParams.get("error") === "access_denied" && a.location.searchParams.get("iss") === asm.issuer, "Cancel → access_denied with iss");
@@ -154,6 +188,8 @@ try {
   r = await token({ client_id: cimdId, grant_type: "authorization_code", code: a.location.searchParams.get("code"), code_verifier: a.verifier, redirect_uri: chatgptRedirect, resource: `${base}/mcp` });
   const cimdTokens = await r.json();
   ok(r.status === 200 && cimdTokens.access_token, "CIMD: public-client token exchange (no secret)");
+  a = await authorize({ clientId: cimdId, redirectUri: chatgptRedirect, scope: "admin:everything" });
+  ok(a.location.searchParams.get("error") === "invalid_scope" && a.location.searchParams.get("iss") === asm.issuer, "CIMD: errors redirect back to the verified client, with iss");
   m = await mcp(cimdTokens.access_token, "tools/call", { name: "whoami", arguments: {} });
   ok(m.body.result.structuredContent.id === profile.id, "CIMD: same user, same profile id across clients");
 
@@ -165,6 +201,11 @@ try {
   ok(r.status === 400, "CIMD: redirect_uri outside the document rejected");
   r = await fetch(`${asm.authorization_endpoint}?response_type=code&client_id=${encodeURIComponent("https://127.0.0.1/oauth/client.json")}&redirect_uri=${encodeURIComponent(chatgptRedirect)}&code_challenge=x&code_challenge_method=S256`, { redirect: "manual" });
   ok(r.status === 400, "CIMD: private-address metadata URL refused (SSRF)");
+  for (const host of ["[::ffff:127.0.0.1]", "[::ffff:a9fe:a9fe]", "[64:ff9b::7f00:1]", "[2002:7f00:1::]"]) {
+    r = await fetch(`${asm.authorization_endpoint}?response_type=code&client_id=${encodeURIComponent(`https://${host}/oauth/client.json`)}&redirect_uri=${encodeURIComponent(chatgptRedirect)}&code_challenge=x&code_challenge_method=S256`, { redirect: "manual" });
+    const body = await r.text();
+    ok(r.status === 400 && body.includes("Could not fetch client metadata") && !/ECONN|HTTP \d|JSON/.test(body), `CIMD: ${host} refused with a generic error`);
+  }
 } finally {
   metadataServer.close();
 }

@@ -1,9 +1,12 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import cors from "cors";
-import express, { Router, type RequestHandler } from "express";
+import express, { Router, type Request, type RequestHandler } from "express";
+import { ipKeyGenerator } from "express-rate-limit";
 import { createOAuthMetadata, mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
-import { sendPage } from "../html.js";
+import { page, sendPage } from "../html.js";
 import type { McpKitOptions } from "../types.js";
+import { isClientMetadataUrl } from "./client-metadata.js";
+import { renderConnectionsPage } from "./connections-page.js";
 import { renderConsentPage, renderExpiredPage } from "./consent-page.js";
 import { PostgresOAuthProvider } from "./provider.js";
 
@@ -46,27 +49,56 @@ export function createOAuthRouter(options: McpKitOptions) {
     resource_name: options.branding.name,
   };
 
-  // CSRF token for the consent form, bound to this request and this user.
-  const consentToken = (requestId: string, userId: string) =>
-    createHmac("sha256", options.secret)
-      .update(`consent:${requestId}:${userId}`)
-      .digest("base64url");
+  // CSRF tokens for the consent and disconnect forms, bound to the user.
+  const formToken = (purpose: string, userId: string) =>
+    createHmac("sha256", options.secret).update(`${purpose}:${userId}`).digest("base64url");
+  const consentToken = (requestId: string, userId: string) => formToken(`consent:${requestId}`, userId);
+  const tokenMatches = (expected: string, given: unknown) => {
+    const a = Buffer.from(expected);
+    const b = Buffer.from(String(given ?? ""));
+    return a.length === b.length && timingSafeEqual(a, b);
+  };
+  const allowLoopback = options.allowLoopbackClientMetadata ?? false;
+
+  // The SDK limits per IP by default, but ChatGPT, Claude and Le Chat call
+  // /token and /register from shared backend IPs, so one busy app would lock
+  // out all its users. Key on client_id + IP instead.
+  const perClient = (windowMs: number, limit: number) => ({
+    windowMs,
+    limit,
+    max: limit, // the SDK sets `max`; set both so ours wins either way
+    keyGenerator: (request: Request) =>
+      `${String(request.body?.client_id ?? request.query.client_id ?? "")}|${ipKeyGenerator(request.ip ?? "")}`,
+  });
 
   // The SDK's /authorize handler redirects some errors (bad scope, bad PKCE
-  // params) straight to the client. Add `iss` to those too: a client that
-  // was told we support RFC 9207 rejects any redirect without it.
-  const addIssToClientRedirects: RequestHandler = (_request, response, next) => {
+  // params) straight to the client, before any user interaction.
+  //   - Add `iss`: a client told we support RFC 9207 rejects redirects without it.
+  //   - For clients that aren't verified (DCR: anyone can register any
+  //     redirect URI), show the error here instead, so our domain can't be
+  //     used as an open redirector in phishing links (RFC 9700 §4.11.2).
+  const guardClientRedirects: RequestHandler = (request, response, next) => {
+    const verified = isClientMetadataUrl(String(request.query.client_id ?? ""), { allowLoopback });
     const redirect = response.redirect.bind(response) as (status: number, url: string) => void;
     response.redirect = ((statusOrUrl: number | string, maybeUrl?: string) => {
       const status = typeof statusOrUrl === "number" ? statusOrUrl : 302;
       const target = new URL(String(typeof statusOrUrl === "number" ? maybeUrl : statusOrUrl), issuerUrl);
-      if (target.origin !== issuerUrl.origin && !target.searchParams.has("iss")) {
-        target.searchParams.set("iss", oauthMetadata.issuer);
+      if (target.origin === issuerUrl.origin) return redirect(status, target.toString());
+      const error = target.searchParams.get("error");
+      if (error && !verified) {
+        sendPage(
+          response,
+          page(options.branding, "Can't connect", `<h1>Can't connect this app</h1><p>The app sent an invalid sign-in request (${escapeError(error)}). Start the connection again from your AI app.</p>`),
+          400
+        );
+        return;
       }
+      if (!target.searchParams.has("iss")) target.searchParams.set("iss", oauthMetadata.issuer);
       redirect(status, target.toString());
     }) as typeof response.redirect;
     next();
   };
+  const escapeError = (code: string) => code.replace(/[^a-z_]/g, "");
 
   const router = Router();
   const metadataCors = cors({ origin: true, methods: ["GET", "OPTIONS"] });
@@ -78,7 +110,7 @@ export function createOAuthRouter(options: McpKitOptions) {
   router.get("/.well-known/oauth-protected-resource", (_request, response) => {
     response.json(protectedResourceMetadata);
   });
-  router.use("/authorize", addIssToClientRedirects);
+  router.use("/authorize", guardClientRedirects);
   router.use(
     mcpAuthRouter({
       provider,
@@ -87,6 +119,11 @@ export function createOAuthRouter(options: McpKitOptions) {
       resourceServerUrl,
       scopesSupported,
       resourceName: options.branding.name,
+      tokenOptions: { rateLimit: perClient(15 * 60 * 1000, 300) },
+      revocationOptions: { rateLimit: perClient(15 * 60 * 1000, 300) },
+      // Registration has no client_id yet; ChatGPT registers once per
+      // connection from shared IPs, so allow more than the SDK's 20/hour.
+      clientRegistrationOptions: { rateLimit: { windowMs: 60 * 60 * 1000, limit: 300, max: 300 } },
     })
   );
 
@@ -119,9 +156,7 @@ export function createOAuthRouter(options: McpKitOptions) {
       try {
         const userId = response.locals.userId as string;
         const requestId = String(request.body?.requestId ?? "");
-        const expected = Buffer.from(consentToken(requestId, userId));
-        const given = Buffer.from(String(request.body?.csrf ?? ""));
-        if (expected.length !== given.length || !timingSafeEqual(expected, given)) {
+        if (!tokenMatches(consentToken(requestId, userId), request.body?.csrf)) {
           response.status(403).json({ error: "invalid_consent" });
           return;
         }
@@ -130,6 +165,43 @@ export function createOAuthRouter(options: McpKitOptions) {
             ? await provider.consent(requestId, userId)
             : await provider.deny(requestId);
         response.redirect(303, redirectUrl);
+      } catch (error) {
+        next(error);
+      }
+    }
+  );
+
+  router.get("/connections", options.session.requireUser, async (_request, response, next) => {
+    try {
+      const userId = response.locals.userId as string;
+      sendPage(
+        response,
+        renderConnectionsPage({
+          branding: options.branding,
+          connections: await provider.listConnections(userId),
+          scopeLabels: options.scopes,
+          csrf: formToken("connections", userId),
+        })
+      );
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post(
+    "/connections/disconnect",
+    express.urlencoded({ extended: false }),
+    options.session.requireUser,
+    async (request, response, next) => {
+      try {
+        const userId = response.locals.userId as string;
+        if (!tokenMatches(formToken("connections", userId), request.body?.csrf)) {
+          response.status(403).json({ error: "invalid_request" });
+          return;
+        }
+        const connectionId = String(request.body?.connectionId ?? "");
+        if (/^[0-9a-f-]{36}$/i.test(connectionId)) await provider.revokeConnection(connectionId, userId);
+        response.redirect(303, "/connections");
       } catch (error) {
         next(error);
       }

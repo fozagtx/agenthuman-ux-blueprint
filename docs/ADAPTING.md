@@ -86,7 +86,8 @@ One file per area under `src/project/tools/` (e.g. `catalog.ts`, `cart.ts`,
 
 ```ts
 // src/project/tools/catalog.ts
-import { logTool, resolveToolContext, result } from "../../mcp-kit/index.js";
+import { logTool, result } from "../../mcp-kit/index.js";
+import { toolContext } from "./context.js";
 
 server.registerTool(
   "search_products",
@@ -97,7 +98,7 @@ server.registerTool(
     annotations: { readOnlyHint: true },
   },
   async (args, extra) => {
-    const { context, error } = await resolveToolContext(db, extra.authInfo, "catalog:read");
+    const { context, error } = await toolContext(db, extra.authInfo, "catalog:read");
     if (error) return result(error, true);
     const products = await searchProducts(args.query, args.limit); // your code
     await logTool(db, context.connectionId, "search_products", args, "allowed");
@@ -120,15 +121,20 @@ Rules that keep it safe:
 
 ## 6. Let users disconnect
 
-Add a settings screen that lists the user's rows in `connections` (join
-`oauth_clients` for the name) and calls:
+The kit serves a "Connected apps" page at `/connections`: every AI app the
+signed-in user allowed, with a Disconnect button each. Link to it from your
+app's settings. Disconnecting revokes every token for that connection, and
+the AI app's next call gets 401. Every connection also ends on its own 90 days
+after it was allowed.
+
+To build the page into your own frontend instead, use the same provider
+methods:
 
 ```ts
-const mcp = createMcpKit({...});              // in app.ts
+const mcp = createMcpKit({...});                       // in app.ts
+const apps = await mcp.provider.listConnections(userId);
 await mcp.provider.revokeConnection(connectionId, userId);
 ```
-
-That revokes every token for that connection; the AI app's next call gets 401.
 
 ## 7. Deploy
 
@@ -149,4 +155,5 @@ That revokes every token for that connection; the AI app's next call gets 401.
 - [ ] Users can see and revoke connections
 - [ ] `pnpm e2e` passes against staging (`BASE_URL=https://staging… pnpm e2e`,
       after adapting the login step in the script)
+- [ ] `NODE_ENV=production` and `TRUST_PROXY` set to your real proxy count
 - [ ] Tested in each AI app you support (see the README's "Connect it" table)

@@ -59,6 +59,11 @@ export function page(branding: Branding, title: string, body: string) {
   li { margin:4px 0; }
   .note { font-size:13px; padding:10px 12px; border:1px solid var(--line); border-radius:10px; }
   .note strong { color:var(--ink); }
+  .connections { list-style:none; padding:0; }
+  .connection { display:flex; gap:12px; align-items:center; justify-content:space-between;
+                padding:12px 0; border-top:1px solid var(--line); }
+  .connection p { margin:2px 0 0; font-size:13px; }
+  .connection form { flex:0 0 auto; display:flex; }
   input { width:100%; padding:10px 12px; margin:0 0 12px; border:1px solid var(--line);
           border-radius:10px; background:transparent; color:inherit; font:inherit; }
   .row { display:flex; gap:10px; }

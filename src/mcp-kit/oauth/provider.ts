@@ -13,6 +13,7 @@ import type {
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import {
+  InvalidClientMetadataError,
   InvalidGrantError,
   InvalidScopeError,
   InvalidTargetError,
@@ -26,6 +27,7 @@ import {
   oauthCodes,
   oauthTokens,
   rateLimits,
+  toolActivity,
 } from "../schema.js";
 import {
   fetchClientMetadata,
@@ -38,9 +40,14 @@ const REFRESH_TOKEN_SECONDS = 30 * 24 * 60 * 60;
 const AUTHORIZATION_REQUEST_SECONDS = 10 * 60;
 const CODE_SECONDS = 5 * 60;
 const CLIENT_METADATA_CACHE_SECONDS = 60 * 60;
-// A refresh token reused within this window is treated as a client retry
-// (rejected, nothing else revoked); after it, as theft (whole family revoked).
-const REFRESH_REUSE_GRACE_SECONDS = 60;
+// A connection ends this long after the user approved it, however often it
+// refreshes, so a leaked refresh token can't grant access forever.
+const CONNECTION_MAX_AGE_SECONDS = 90 * 24 * 60 * 60;
+const UNUSED_CLIENT_DAYS = 7;
+const TOOL_ACTIVITY_DAYS = 90;
+
+const connectionExpiresAt = (createdAt: Date) =>
+  new Date(createdAt.getTime() + CONNECTION_MAX_AGE_SECONDS * 1000);
 
 function digest(value: string) {
   return createHash("sha256").update(value).digest("hex");
@@ -60,6 +67,23 @@ function sameResource(a: string, b: string) {
     return url.href.replace(/\/$/, "");
   };
   return normalize(a) === normalize(b);
+}
+
+/**
+ * Client names are chosen by the client. Strip control and format characters
+ * (bidi overrides, zero-width joiners) so one can't visually impersonate
+ * another app, and cap the length.
+ */
+function displayName(name: string) {
+  const clean = name.replace(/[\p{Cc}\p{Cf}]/gu, "").replace(/\s+/g, " ").trim();
+  return (clean.length > 64 ? `${clean.slice(0, 63)}…` : clean) || "Unnamed app";
+}
+
+/** "chatgpt.com", "localhost:3000", or "myapp://" for custom-scheme apps. */
+function redirectTarget(redirectUri: string) {
+  const url = new URL(redirectUri);
+  if (url.protocol === "https:" || url.protocol === "http:") return url.host;
+  return `${url.protocol}//${url.host}`;
 }
 
 export type PendingAuthorization = {
@@ -119,6 +143,11 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
       // client_secret_post. Keep the client's chosen auth method so the
       // registration response never says "none" while also requiring a secret.
       registerClient: async (metadata) => {
+        // The SDK reads client secrets from the request body only, so a
+        // client_secret_basic client could never authenticate.
+        if (metadata.token_endpoint_auth_method === "client_secret_basic") {
+          throw new InvalidClientMetadataError("Use token_endpoint_auth_method none or client_secret_post");
+        }
         const clientId = randomBytes(24).toString("base64url");
         const client = {
           ...metadata,
@@ -228,9 +257,9 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
     if (!pending) return undefined;
     return {
       requestId: pending.requestId,
-      clientName: pending.clientName,
+      clientName: displayName(pending.clientName),
       scopes: pending.scopes,
-      redirectHost: new URL(pending.redirectUri).host,
+      redirectHost: redirectTarget(pending.redirectUri),
       ...(isClientMetadataUrl(pending.clientId, this.options.clientMetadata)
         ? { verifiedClientHost: new URL(pending.clientId).host }
         : {}),
@@ -341,16 +370,14 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
     const [stored] = await this.db
       .select()
       .from(oauthCodes)
-      .where(
-        and(
-          eq(oauthCodes.codeHash, digest(code)),
-          eq(oauthCodes.clientId, client.client_id),
-          isNull(oauthCodes.consumedAt),
-          gt(oauthCodes.expiresAt, new Date())
-        )
-      )
+      .where(and(eq(oauthCodes.codeHash, digest(code)), eq(oauthCodes.clientId, client.client_id)))
       .limit(1);
-    if (!stored || !codeVerifier || stored.redirectUri !== redirectUri) {
+    if (stored?.consumedAt) {
+      // A code used twice was intercepted: revoke what the first use issued.
+      await this.revokeConnectionTokens(stored.connectionId);
+      throw new InvalidGrantError("Invalid or expired authorization grant");
+    }
+    if (!stored || stored.expiresAt <= new Date() || !codeVerifier || stored.redirectUri !== redirectUri) {
       throw new InvalidGrantError("Invalid or expired authorization grant");
     }
     const verifierHash = createHash("sha256").update(codeVerifier).digest("base64url");
@@ -389,15 +416,10 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
       .limit(1);
     if (!stored) throw new InvalidGrantError("Invalid or expired authorization grant");
     if (stored.revokedAt) {
-      const sinceRevoked = Date.now() - stored.revokedAt.getTime();
-      if (sinceRevoked > REFRESH_REUSE_GRACE_SECONDS * 1000) {
-        // A long-rotated refresh token came back: someone holds a stolen copy.
-        // Kill every token from this consent so both copies stop working.
-        await this.db
-          .update(oauthTokens)
-          .set({ revokedAt: new Date() })
-          .where(and(eq(oauthTokens.familyId, stored.familyId), isNull(oauthTokens.revokedAt)));
-      }
+      // A rotated refresh token came back, so two parties hold copies and we
+      // can't tell which is legitimate. Revoke every token from this consent;
+      // the real user reconnects, the thief is locked out.
+      await this.revokeFamily(stored.familyId);
       throw new InvalidGrantError("Invalid or expired authorization grant");
     }
     const [rotated] = await this.db
@@ -430,7 +452,9 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
       )
       .limit(1);
     if (!stored || stored.token.revokedAt) throw new InvalidTokenError("invalid_token");
-    if (stored.connection.revokedAt) throw new InvalidTokenError("connection_revoked");
+    if (stored.connection.revokedAt || connectionExpiresAt(stored.connection.createdAt) <= new Date()) {
+      throw new InvalidTokenError("connection_revoked");
+    }
     return {
       token,
       clientId: stored.token.clientId,
@@ -444,11 +468,56 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
     };
   }
 
-  async revokeToken(_client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest) {
+  /** RFC 7009: a client may only revoke its own tokens. Revoking a refresh token ends the grant. */
+  async revokeToken(client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest) {
+    const [stored] = await this.db
+      .select({ type: oauthTokens.type, familyId: oauthTokens.familyId })
+      .from(oauthTokens)
+      .where(and(eq(oauthTokens.hash, digest(request.token)), eq(oauthTokens.clientId, client.client_id)))
+      .limit(1);
+    if (!stored) return; // unknown tokens are not an error (RFC 7009 §2.2)
+    if (stored.type === "refresh") {
+      await this.revokeFamily(stored.familyId);
+      return;
+    }
     await this.db
       .update(oauthTokens)
       .set({ revokedAt: new Date() })
       .where(and(eq(oauthTokens.hash, digest(request.token)), isNull(oauthTokens.revokedAt)));
+  }
+
+  private async revokeFamily(familyId: string) {
+    await this.db
+      .update(oauthTokens)
+      .set({ revokedAt: new Date() })
+      .where(and(eq(oauthTokens.familyId, familyId), isNull(oauthTokens.revokedAt)));
+  }
+
+  private async revokeConnectionTokens(connectionId: string) {
+    await this.db
+      .update(oauthTokens)
+      .set({ revokedAt: new Date() })
+      .where(and(eq(oauthTokens.connectionId, connectionId), isNull(oauthTokens.revokedAt)));
+  }
+
+  /** The signed-in user's live connections, for a "Connected apps" page. */
+  async listConnections(userId: string) {
+    const rows = await this.db
+      .select({
+        id: connections.id,
+        clientId: connections.clientId,
+        clientName: oauthClients.name,
+        scopes: connections.scopes,
+        createdAt: connections.createdAt,
+      })
+      .from(connections)
+      .innerJoin(oauthClients, eq(oauthClients.id, connections.clientId))
+      .where(and(eq(connections.userId, userId), isNull(connections.revokedAt)))
+      .orderBy(connections.createdAt);
+    const now = new Date();
+    return rows
+      .map((row) => ({ ...row, expiresAt: connectionExpiresAt(row.createdAt) }))
+      .filter((row) => row.expiresAt > now);
   }
 
   /** For your settings page: "Disconnect <AI app>". */
@@ -465,24 +534,39 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
       )
       .returning({ id: connections.id });
     if (!revoked) return false;
-    await this.db
-      .update(oauthTokens)
-      .set({ revokedAt: new Date() })
-      .where(and(eq(oauthTokens.connectionId, connectionId), isNull(oauthTokens.revokedAt)));
+    await this.revokeConnectionTokens(connectionId);
     return true;
   }
 
-  /** Deletes expired sign-in state. Run periodically (server.ts does, hourly). */
+  /** Deletes expired state so tables stay bounded. Run periodically (server.ts does, hourly). */
   async purgeExpired() {
     const now = new Date();
-    const dayAgo = sql`now() - interval '1 day'`;
     await this.db.delete(oauthAuthorizationRequests).where(lt(oauthAuthorizationRequests.expiresAt, now));
+    // Consumed codes are kept until expiry so a replay is still detected.
     await this.db.delete(oauthCodes).where(lt(oauthCodes.expiresAt, now));
-    // Keep revoked refresh tokens a day so reuse detection still sees them.
-    await this.db
-      .delete(oauthTokens)
-      .where(or(lt(oauthTokens.expiresAt, now), lt(oauthTokens.revokedAt, dayAgo)));
+    // Revoked refresh tokens are kept until they'd have expired, so a stolen
+    // copy presented later still triggers reuse detection.
+    await this.db.delete(oauthTokens).where(lt(oauthTokens.expiresAt, now));
     await this.db.delete(rateLimits).where(lt(rateLimits.expiresAt, now));
+    // Ended connections (revoked, or past their maximum age) and their audit trail.
+    await this.db
+      .delete(connections)
+      .where(
+        or(
+          lt(connections.revokedAt, sql`now() - interval '${sql.raw(String(TOOL_ACTIVITY_DAYS))} days'`),
+          lt(connections.createdAt, sql`now() - interval '${sql.raw(String(CONNECTION_MAX_AGE_SECONDS / 86400 + TOOL_ACTIVITY_DAYS))} days'`)
+        )
+      );
+    await this.db
+      .delete(toolActivity)
+      .where(lt(toolActivity.createdAt, sql`now() - interval '${sql.raw(String(TOOL_ACTIVITY_DAYS))} days'`));
+    // Clients (DCR registrations, cached CIMD documents) nobody connected with.
+    await this.db.execute(sql`
+      DELETE FROM oauth_clients c
+      WHERE c.created_at < now() - interval '${sql.raw(String(UNUSED_CLIENT_DAYS))} days'
+        AND NOT EXISTS (SELECT 1 FROM connections WHERE client_id = c.id)
+        AND NOT EXISTS (SELECT 1 FROM oauth_authorization_requests WHERE client_id = c.id)
+    `);
   }
 
   private async issueTokenPair(
@@ -497,6 +581,8 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
       .where(and(eq(connections.id, connectionId), isNull(connections.revokedAt)))
       .limit(1);
     if (!connection) throw new InvalidGrantError("Invalid or expired authorization grant");
+    const endsAt = connectionExpiresAt(connection.createdAt).getTime();
+    if (endsAt <= Date.now()) throw new InvalidGrantError("Connection expired; reconnect");
     const accessToken = randomBytes(32).toString("base64url");
     const refreshToken = randomBytes(48).toString("base64url");
     const familyId = existingFamilyId ?? randomUUID();
@@ -508,19 +594,19 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
         ...shared,
         hash: digest(accessToken),
         type: "access",
-        expiresAt: new Date(now + ACCESS_TOKEN_SECONDS * 1000),
+        expiresAt: new Date(Math.min(now + ACCESS_TOKEN_SECONDS * 1000, endsAt)),
       },
       {
         ...shared,
         hash: digest(refreshToken),
         type: "refresh",
-        expiresAt: new Date(now + REFRESH_TOKEN_SECONDS * 1000),
+        expiresAt: new Date(Math.min(now + REFRESH_TOKEN_SECONDS * 1000, endsAt)),
       },
     ]);
     return {
       access_token: accessToken,
       token_type: "Bearer",
-      expires_in: ACCESS_TOKEN_SECONDS,
+      expires_in: Math.max(1, Math.floor((Math.min(now + ACCESS_TOKEN_SECONDS * 1000, endsAt) - now) / 1000)),
       refresh_token: refreshToken,
       scope: scopes.join(" "),
     };

@@ -13,8 +13,9 @@ import { registerTools } from "./project/tools/index.js";
 export function createApp(db: Database, config: Config) {
   const app = express();
   app.disable("x-powered-by");
-  // Behind Render/Fly/Railway/Cloudflare the TLS ends at a proxy.
-  app.set("trust proxy", 1);
+  // Behind Render/Fly/Railway/Cloudflare the TLS ends at a proxy. The hop
+  // count must match reality, or clients can spoof their IP for rate limits.
+  app.set("trust proxy", config.trustProxy);
 
   const session = createCookieSession(config.sessionSecret, config.apiUrl.startsWith("https://"));
 
@@ -27,8 +28,9 @@ export function createApp(db: Database, config: Config) {
     scopes: SCOPES,
     registerTools,
     serverInfo: { name: "agenthuman-ux", version: "0.1.0" },
-    // Lets scripts/e2e.mjs act as a CIMD client over http://localhost.
-    allowLoopbackClientMetadata: config.devLogin,
+    // Lets scripts/e2e.mjs act as a CIMD client over http://localhost. Only
+    // on a local dev server: never behind a tunnel or in production.
+    allowLoopbackClientMetadata: config.devLogin && new URL(config.apiUrl).hostname === "localhost",
   });
   app.use(mcp.router);
 

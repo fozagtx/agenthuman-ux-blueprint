@@ -25,10 +25,17 @@ function readCookie(request: Request, name: string) {
   return undefined;
 }
 
-/** Only allow redirects back into this site, never to another origin. */
+/**
+ * Only allow redirects back into this site, never to another origin.
+ * Browsers read `/\evil.com` (and tab/newline tricks) as `//evil.com`, so
+ * resolve the path against a dummy origin and require it to stay there.
+ */
 export function safeNext(value: unknown) {
   const next = typeof value === "string" ? value : "";
-  return next.startsWith("/") && !next.startsWith("//") ? next : "/";
+  if (!next.startsWith("/") || /[\\\u0000-\u001f\u007f]/.test(next)) return "/";
+  const base = "https://same-origin.invalid";
+  const resolved = new URL(next, base);
+  return resolved.origin === base ? `${resolved.pathname}${resolved.search}` : "/";
 }
 
 export function createCookieSession(secret: string, secure: boolean): Session {
