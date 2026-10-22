@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID, createHash, timingSafeEqual } from "node:crypto";
 import type { Response } from "express";
-import { and, eq, gt, isNull } from "drizzle-orm";
+import { and, eq, gt, isNull, lt, or, sql } from "drizzle-orm";
 import type {
   AuthorizationParams,
   OAuthServerProvider,
@@ -14,6 +14,8 @@ import type {
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import {
   InvalidGrantError,
+  InvalidScopeError,
+  InvalidTargetError,
   InvalidTokenError,
 } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { Database } from "../../db/client.js";
@@ -23,12 +25,22 @@ import {
   oauthClients,
   oauthCodes,
   oauthTokens,
+  rateLimits,
 } from "../schema.js";
+import {
+  fetchClientMetadata,
+  isClientMetadataUrl,
+  type ClientMetadataOptions,
+} from "./client-metadata.js";
 
 const ACCESS_TOKEN_SECONDS = 15 * 60;
 const REFRESH_TOKEN_SECONDS = 30 * 24 * 60 * 60;
 const AUTHORIZATION_REQUEST_SECONDS = 10 * 60;
 const CODE_SECONDS = 5 * 60;
+const CLIENT_METADATA_CACHE_SECONDS = 60 * 60;
+// A refresh token reused within this window is treated as a client retry
+// (rejected, nothing else revoked); after it, as theft (whole family revoked).
+const REFRESH_REUSE_GRACE_SECONDS = 60;
 
 function digest(value: string) {
   return createHash("sha256").update(value).digest("hex");
@@ -40,20 +52,54 @@ function constantTimeEqual(left: string, right: string) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/** RFC 8707 resources compare equal ignoring a fragment and one trailing slash. */
+function sameResource(a: string, b: string) {
+  const normalize = (value: string) => {
+    const url = new URL(value);
+    url.hash = "";
+    return url.href.replace(/\/$/, "");
+  };
+  return normalize(a) === normalize(b);
+}
+
 export type PendingAuthorization = {
   requestId: string;
   clientName: string;
   scopes: string[];
+  /** Where the code will be sent. Shown so the user can spot a look-alike app. */
+  redirectHost: string;
+  /**
+   * Set when the client identified itself with a metadata URL (CIMD): its
+   * host is proven by HTTPS, unlike a self-chosen DCR client_name.
+   */
+  verifiedClientHost?: string;
+};
+
+export type ProviderOptions = {
+  /** Exact `issuer` string from the authorization server metadata. Sent as `iss` (RFC 9207). */
+  issuer: string;
+  /** The MCP endpoint tokens are minted for, e.g. https://mcp.example.com/mcp. */
+  resource: URL;
+  /** Where /authorize sends the user to approve. Gets ?requestId=… appended. */
+  consentUrl: URL;
+  supportedScopes: string[];
+  clientMetadata?: ClientMetadataOptions;
 };
 
 /**
  * OAuth 2.1 authorization server backed by Postgres, implementing the MCP SDK's
  * provider interface. The SDK handles the HTTP side (/authorize, /token,
- * /register, /revoke, .well-known metadata); this class stores and checks state.
+ * /register, /revoke); this class stores and checks state.
  *
- * Flow: Claude registers → /authorize stores a pending request and redirects
- * the user to the consent page → the user approves → consent() mints a one-time
- * code → Claude exchanges it (with its PKCE verifier) for access + refresh tokens.
+ * Clients identify themselves one of two ways:
+ *   - CIMD: client_id is an HTTPS URL to a metadata document (ChatGPT, Claude,
+ *     Claude Code, Codex prefer this)
+ *   - DCR:  the client POSTs /register and gets a random client_id (Le Chat,
+ *     and the fallback for everyone else)
+ *
+ * Flow: /authorize stores a pending request and redirects the user to the
+ * consent page → the user approves → consent() mints a one-time code → the
+ * client exchanges it (with its PKCE verifier) for access + refresh tokens.
  */
 export class PostgresOAuthProvider implements OAuthServerProvider {
   // PKCE is checked inside exchangeAuthorizationCode with a constant-time compare.
@@ -62,19 +108,13 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
 
   constructor(
     private readonly db: Database,
-    /** Where /authorize sends the user to approve. Gets ?requestId=… appended. */
-    private readonly consentUrl: URL,
-    private readonly supportedScopes: string[]
+    private readonly options: ProviderOptions
   ) {
     this.clientsStore = {
-      getClient: async (clientId) => {
-        const [client] = await db
-          .select()
-          .from(oauthClients)
-          .where(eq(oauthClients.id, clientId))
-          .limit(1);
-        return client?.metadata as OAuthClientInformationFull | undefined;
-      },
+      getClient: (clientId) =>
+        isClientMetadataUrl(clientId, options.clientMetadata)
+          ? this.metadataClient(clientId)
+          : this.registeredClient(clientId),
       // The SDK has already issued a client_secret when the client asked for
       // client_secret_post. Keep the client's chosen auth method so the
       // registration response never says "none" while also requiring a secret.
@@ -96,13 +136,59 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
     };
   }
 
+  private async registeredClient(clientId: string) {
+    const [client] = await this.db
+      .select()
+      .from(oauthClients)
+      .where(eq(oauthClients.id, clientId))
+      .limit(1);
+    return client?.metadata as OAuthClientInformationFull | undefined;
+  }
+
+  /**
+   * CIMD client: use the cached document if it's fresh, otherwise fetch and
+   * validate it again. The row is kept in oauth_clients so connections,
+   * codes and tokens can reference it like any registered client.
+   */
+  private async metadataClient(clientId: string) {
+    const [cached] = await this.db
+      .select()
+      .from(oauthClients)
+      .where(eq(oauthClients.id, clientId))
+      .limit(1);
+    const fresh =
+      cached?.metadataFetchedAt &&
+      Date.now() - cached.metadataFetchedAt.getTime() < CLIENT_METADATA_CACHE_SECONDS * 1000;
+    if (fresh) return cached.metadata as unknown as OAuthClientInformationFull;
+    const client = await fetchClientMetadata(clientId, this.options.clientMetadata);
+    const row = {
+      name: String(client.client_name),
+      redirectUris: client.redirect_uris,
+      metadata: client as unknown as Record<string, unknown>,
+      metadataFetchedAt: new Date(),
+    };
+    await this.db
+      .insert(oauthClients)
+      .values({ id: clientId, ...row })
+      .onConflictDoUpdate({ target: oauthClients.id, set: row });
+    return client;
+  }
+
   async authorize(
     client: OAuthClientInformationFull,
     params: AuthorizationParams,
     response: Response
   ) {
-    const requested = params.scopes?.length ? params.scopes : this.supportedScopes;
-    const scopes = requested.filter((scope) => this.supportedScopes.includes(scope));
+    // Tokens only ever work at our /mcp, so a request for another resource
+    // can't be honoured; a missing one means ours.
+    if (params.resource && !sameResource(params.resource.href, this.options.resource.href)) {
+      throw new InvalidTargetError("Unknown resource");
+    }
+    const { supportedScopes } = this.options;
+    const scopes = params.scopes?.length
+      ? params.scopes.filter((scope) => supportedScopes.includes(scope))
+      : supportedScopes;
+    if (scopes.length === 0) throw new InvalidScopeError("No supported scopes requested");
     const requestId = randomBytes(24).toString("base64url");
     await this.db.insert(oauthAuthorizationRequests).values({
       requestId,
@@ -111,20 +197,22 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
       state: params.state ?? null,
       codeChallenge: params.codeChallenge,
       scopes,
-      resource: params.resource?.toString() ?? null,
+      resource: this.options.resource.href,
       expiresAt: new Date(Date.now() + AUTHORIZATION_REQUEST_SECONDS * 1000),
     });
-    const consent = new URL(this.consentUrl);
+    const consent = new URL(this.options.consentUrl);
     consent.searchParams.set("requestId", requestId);
     response.redirect(consent.toString());
   }
 
-  /** What the consent page needs to show: who is asking and for which scopes. */
+  /** What the consent page needs to show: who is asking, for what, and where it goes. */
   async pendingAuthorization(requestId: string): Promise<PendingAuthorization | undefined> {
     const [pending] = await this.db
       .select({
         requestId: oauthAuthorizationRequests.requestId,
         scopes: oauthAuthorizationRequests.scopes,
+        redirectUri: oauthAuthorizationRequests.redirectUri,
+        clientId: oauthClients.id,
         clientName: oauthClients.name,
       })
       .from(oauthAuthorizationRequests)
@@ -137,7 +225,26 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
         )
       )
       .limit(1);
-    return pending;
+    if (!pending) return undefined;
+    return {
+      requestId: pending.requestId,
+      clientName: pending.clientName,
+      scopes: pending.scopes,
+      redirectHost: new URL(pending.redirectUri).host,
+      ...(isClientMetadataUrl(pending.clientId, this.options.clientMetadata)
+        ? { verifiedClientHost: new URL(pending.clientId).host }
+        : {}),
+    };
+  }
+
+  /** Redirect back to the client with `iss` (RFC 9207), as every response must. */
+  private clientRedirect(redirectUri: string, params: Record<string, string | null>) {
+    const redirect = new URL(redirectUri);
+    for (const [key, value] of Object.entries(params)) {
+      if (value) redirect.searchParams.set(key, value);
+    }
+    redirect.searchParams.set("iss", this.options.issuer);
+    return redirect.toString();
   }
 
   /**
@@ -185,10 +292,7 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
         expiresAt: new Date(Date.now() + CODE_SECONDS * 1000),
       });
     });
-    const redirect = new URL(pending.redirectUri);
-    redirect.searchParams.set("code", code);
-    if (pending.state) redirect.searchParams.set("state", pending.state);
-    return redirect.toString();
+    return this.clientRedirect(pending.redirectUri, { code, state: pending.state });
   }
 
   /** The user said no. OAuth requires telling the client with error=access_denied. */
@@ -204,10 +308,7 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
       )
       .returning();
     if (!pending) throw new Error("invalid_consent");
-    const redirect = new URL(pending.redirectUri);
-    redirect.searchParams.set("error", "access_denied");
-    if (pending.state) redirect.searchParams.set("state", pending.state);
-    return redirect.toString();
+    return this.clientRedirect(pending.redirectUri, { error: "access_denied", state: pending.state });
   }
 
   async challengeForAuthorizationCode(client: OAuthClientInformationFull, code: string) {
@@ -234,6 +335,9 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
     redirectUri?: string,
     resource?: URL
   ): Promise<OAuthTokens> {
+    if (resource && !sameResource(resource.href, this.options.resource.href)) {
+      throw new InvalidTargetError("Unknown resource");
+    }
     const [stored] = await this.db
       .select()
       .from(oauthCodes)
@@ -259,12 +363,7 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
       .where(and(eq(oauthCodes.id, stored.id), isNull(oauthCodes.consumedAt)))
       .returning();
     if (!consumed) throw new InvalidGrantError("Invalid or expired authorization grant");
-    return this.issueTokenPair(
-      stored.connectionId,
-      client.client_id,
-      stored.scopes,
-      resource?.toString() ?? stored.resource ?? undefined
-    );
+    return this.issueTokenPair(stored.connectionId, client.client_id, stored.scopes);
   }
 
   async exchangeRefreshToken(
@@ -273,6 +372,9 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
     scopes?: string[],
     resource?: URL
   ): Promise<OAuthTokens> {
+    if (resource && !sameResource(resource.href, this.options.resource.href)) {
+      throw new InvalidTargetError("Unknown resource");
+    }
     const [stored] = await this.db
       .select()
       .from(oauthTokens)
@@ -287,12 +389,15 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
       .limit(1);
     if (!stored) throw new InvalidGrantError("Invalid or expired authorization grant");
     if (stored.revokedAt) {
-      // A rotated refresh token came back: someone holds a stolen copy.
-      // Kill every token from this consent so both copies stop working.
-      await this.db
-        .update(oauthTokens)
-        .set({ revokedAt: new Date() })
-        .where(and(eq(oauthTokens.familyId, stored.familyId), isNull(oauthTokens.revokedAt)));
+      const sinceRevoked = Date.now() - stored.revokedAt.getTime();
+      if (sinceRevoked > REFRESH_REUSE_GRACE_SECONDS * 1000) {
+        // A long-rotated refresh token came back: someone holds a stolen copy.
+        // Kill every token from this consent so both copies stop working.
+        await this.db
+          .update(oauthTokens)
+          .set({ revokedAt: new Date() })
+          .where(and(eq(oauthTokens.familyId, stored.familyId), isNull(oauthTokens.revokedAt)));
+      }
       throw new InvalidGrantError("Invalid or expired authorization grant");
     }
     const [rotated] = await this.db
@@ -305,13 +410,7 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
     const nextScopes = scopes?.length
       ? scopes.filter((scope) => stored.scopes.includes(scope))
       : stored.scopes;
-    return this.issueTokenPair(
-      stored.connectionId,
-      client.client_id,
-      nextScopes,
-      resource?.toString() ?? stored.resource ?? undefined,
-      stored.familyId
-    );
+    return this.issueTokenPair(stored.connectionId, client.client_id, nextScopes, stored.familyId);
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
@@ -337,7 +436,7 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
       clientId: stored.token.clientId,
       scopes: stored.token.scopes,
       expiresAt: Math.floor(stored.token.expiresAt.getTime() / 1000),
-      ...(stored.token.resource ? { resource: new URL(stored.token.resource) } : {}),
+      resource: new URL(stored.token.resource ?? this.options.resource.href),
       extra: {
         connectionId: stored.connection.id,
         userId: stored.connection.userId,
@@ -352,7 +451,7 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
       .where(and(eq(oauthTokens.hash, digest(request.token)), isNull(oauthTokens.revokedAt)));
   }
 
-  /** For your settings page: "Disconnect Claude". */
+  /** For your settings page: "Disconnect <AI app>". */
   async revokeConnection(connectionId: string, userId: string) {
     const [revoked] = await this.db
       .update(connections)
@@ -373,11 +472,23 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
     return true;
   }
 
+  /** Deletes expired sign-in state. Run periodically (server.ts does, hourly). */
+  async purgeExpired() {
+    const now = new Date();
+    const dayAgo = sql`now() - interval '1 day'`;
+    await this.db.delete(oauthAuthorizationRequests).where(lt(oauthAuthorizationRequests.expiresAt, now));
+    await this.db.delete(oauthCodes).where(lt(oauthCodes.expiresAt, now));
+    // Keep revoked refresh tokens a day so reuse detection still sees them.
+    await this.db
+      .delete(oauthTokens)
+      .where(or(lt(oauthTokens.expiresAt, now), lt(oauthTokens.revokedAt, dayAgo)));
+    await this.db.delete(rateLimits).where(lt(rateLimits.expiresAt, now));
+  }
+
   private async issueTokenPair(
     connectionId: string,
     clientId: string,
     scopes: string[],
-    resource?: string,
     existingFamilyId?: string
   ): Promise<OAuthTokens> {
     const [connection] = await this.db
@@ -390,7 +501,8 @@ export class PostgresOAuthProvider implements OAuthServerProvider {
     const refreshToken = randomBytes(48).toString("base64url");
     const familyId = existingFamilyId ?? randomUUID();
     const now = Date.now();
-    const shared = { connectionId, clientId, familyId, scopes, resource: resource ?? null };
+    // Every token is bound to our /mcp, whether or not the client sent `resource`.
+    const shared = { connectionId, clientId, familyId, scopes, resource: this.options.resource.href };
     await this.db.insert(oauthTokens).values([
       {
         ...shared,

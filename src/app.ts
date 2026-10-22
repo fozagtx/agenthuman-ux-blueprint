@@ -27,6 +27,8 @@ export function createApp(db: Database, config: Config) {
     scopes: SCOPES,
     registerTools,
     serverInfo: { name: "agenthuman-ux", version: "0.1.0" },
+    // Lets scripts/e2e.mjs act as a CIMD client over http://localhost.
+    allowLoopbackClientMetadata: config.devLogin,
   });
   app.use(mcp.router);
 
@@ -54,5 +56,5 @@ export function createApp(db: Database, config: Config) {
     }
   );
 
-  return app;
+  return { app, provider: mcp.provider };
 }

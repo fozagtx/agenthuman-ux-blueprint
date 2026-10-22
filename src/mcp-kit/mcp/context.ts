@@ -41,15 +41,18 @@ async function consumeRateLimit(db: Database, connectionId: string) {
  * Every tool starts here. Turns the verified bearer token into "which user,
  * through which connection", re-checks the connection is still live, applies
  * the rate limit and the scope the tool needs.
+ *
+ * Pass `null` as the scope for tools any live connection may call, such as
+ * a profile tool; otherwise the scope the token must carry.
  */
 export async function resolveToolContext(
   db: Database,
   auth: AuthInfo | undefined,
-  requiredScope: string
+  requiredScope: string | null
 ): Promise<{ context: ToolContext; error?: never } | { context?: never; error: Record<string, unknown> }> {
   const connectionId = String(auth?.extra?.connectionId ?? "");
   if (!auth || !connectionId) return { error: { code: "connection_revoked" } };
-  if (!auth.scopes.includes(requiredScope)) {
+  if (requiredScope !== null && !auth.scopes.includes(requiredScope)) {
     return { error: { code: "insufficient_scope", required: requiredScope } };
   }
   if (!(await consumeRateLimit(db, connectionId))) {

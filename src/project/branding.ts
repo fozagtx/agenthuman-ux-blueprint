@@ -5,10 +5,10 @@ import type { Branding } from "../mcp-kit/index.js";
  * How your connector looks. Edit the defaults here, or override per deployment
  * with env vars so one codebase can run under several brands.
  *
- * - name:        consent page heading ("Connect Claude to <name>") and the
+ * - name:        consent page ("<AI app> wants to use your <name> account") and the
  *                server title MCP clients display
- * - faviconPath: served at /favicon.ico and /favicon.<ext>; Claude shows the
- *                connector's icon from it. .svg, .png or .ico
+ * - faviconPath: served at /favicon.ico and /favicon.<ext>, and sent as the
+ *                MCP server's icon. .svg, .png or .ico
  * - accentColor: button colour on the consent and login pages (hex)
  */
 export const BRANDING: Branding = {

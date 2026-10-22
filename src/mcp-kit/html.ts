@@ -1,4 +1,19 @@
+import type { Response } from "express";
 import type { Branding } from "./types.js";
+
+/**
+ * Sends a kit page. These pages ask people to sign in or approve access, so
+ * they must never render inside another site's frame (clickjacking).
+ */
+export function sendPage(response: Response, html: string, status = 200) {
+  response
+    .status(status)
+    .set("X-Frame-Options", "DENY")
+    .set("Content-Security-Policy", "frame-ancestors 'none'")
+    .set("Referrer-Policy", "no-referrer")
+    .type("html")
+    .send(html);
+}
 
 export function escapeHtml(value: string) {
   return value
@@ -42,6 +57,8 @@ export function page(branding: Branding, title: string, body: string) {
   p { margin:0 0 16px; color:var(--muted); }
   ul { margin:0 0 20px; padding-left:20px; }
   li { margin:4px 0; }
+  .note { font-size:13px; padding:10px 12px; border:1px solid var(--line); border-radius:10px; }
+  .note strong { color:var(--ink); }
   input { width:100%; padding:10px 12px; margin:0 0 12px; border:1px solid var(--line);
           border-radius:10px; background:transparent; color:inherit; font:inherit; }
   .row { display:flex; gap:10px; }

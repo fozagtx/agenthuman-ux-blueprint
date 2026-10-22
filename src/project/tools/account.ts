@@ -3,20 +3,34 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v4";
 import type { Database } from "../../db/client.js";
 import { toolActivity } from "../../mcp-kit/schema.js";
-import { logTool, resolveToolContext, result } from "../../mcp-kit/index.js";
+import { logTool, result } from "../../mcp-kit/index.js";
 import { users } from "../schema.js";
+import { toolContext } from "./context.js";
 
-/** Tools about the connection itself. Useful in any project. */
+/**
+ * Tools about the connection itself. Useful in any project, and need no
+ * scope: any live connection may call them, so renaming scopes can't break them.
+ */
 export function registerAccountTools(server: McpServer, db: Database) {
+  // A profile tool, in the shape ChatGPT uses to tell several connected
+  // accounts apart (`_meta["openai/profile"]`, strict output schema). Other
+  // clients just see an ordinary read-only tool.
   server.registerTool(
     "whoami",
     {
       title: "Who am I",
-      description: "Get the account this connection acts for and the scopes it was granted.",
+      description:
+        "Return the account this connection acts for. The id is opaque, unique in this app, and stays the same across reconnections.",
+      inputSchema: z.strictObject({}),
+      outputSchema: z.strictObject({
+        id: z.string().min(1).describe("Opaque, stable account id. Never an email."),
+        email: z.string().optional().describe("For display only."),
+      }),
       annotations: { readOnlyHint: true },
+      _meta: { "openai/profile": true },
     },
-    async (extra) => {
-      const { context, error } = await resolveToolContext(db, extra.authInfo, "notes:read");
+    async (_args, extra) => {
+      const { context, error } = await toolContext(db, extra.authInfo, null);
       if (error) return result(error, true);
       const [user] = await db
         .select({ email: users.email })
@@ -24,7 +38,7 @@ export function registerAccountTools(server: McpServer, db: Database) {
         .where(eq(users.id, context.userId))
         .limit(1);
       await logTool(db, context.connectionId, "whoami", {}, "allowed");
-      return result({ email: user?.email ?? null, scopes: context.scopes });
+      return result({ id: context.userId, ...(user ? { email: user.email } : {}) });
     }
   );
 
@@ -37,7 +51,7 @@ export function registerAccountTools(server: McpServer, db: Database) {
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const { context, error } = await resolveToolContext(db, extra.authInfo, "notes:read");
+      const { context, error } = await toolContext(db, extra.authInfo, null);
       if (error) return result(error, true);
       const rows = await db
         .select({

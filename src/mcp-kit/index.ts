@@ -6,7 +6,7 @@ import { createFaviconRouter } from "./favicon.js";
 import type { McpKitOptions } from "./types.js";
 
 /**
- * Everything Claude needs, as one Express router:
+ * Everything an MCP chat client (ChatGPT, Claude, Le Chat, Gemini…) needs, as one Express router:
  *
  *   POST /mcp                                        the connector URL
  *   GET  /.well-known/oauth-protected-resource/mcp   who issues tokens for /mcp
@@ -25,7 +25,7 @@ import type { McpKitOptions } from "./types.js";
 export function createMcpKit(options: McpKitOptions) {
   const router = Router();
 
-  // /mcp is called by Claude's servers and by browser tools like MCP Inspector.
+  // /mcp is called by AI apps' servers and by browser tools like MCP Inspector.
   // It is authenticated by bearer token, never cookies, so any origin is fine.
   router.use(
     "/mcp",
@@ -47,4 +47,4 @@ export function createMcpKit(options: McpKitOptions) {
 
 export type { Branding, McpKitOptions, Session } from "./types.js";
 export { logTool, resolveToolContext, result, type ToolContext } from "./mcp/context.js";
-export { escapeHtml, page } from "./html.js";
+export { escapeHtml, page, sendPage } from "./html.js";

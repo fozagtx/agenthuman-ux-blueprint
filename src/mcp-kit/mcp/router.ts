@@ -10,7 +10,7 @@ import { faviconMimeType } from "../favicon.js";
  * POST /mcp. Stateless Streamable HTTP: every request builds a fresh server,
  * so it scales horizontally with no sticky sessions. requireBearerAuth answers
  * 401 + WWW-Authenticate when the token is missing, which is what starts
- * Claude's OAuth flow.
+ * the client's OAuth flow.
  */
 export function createMcpRouter(options: McpKitOptions, verifier: OAuthTokenVerifier) {
   const bearer = requireBearerAuth({

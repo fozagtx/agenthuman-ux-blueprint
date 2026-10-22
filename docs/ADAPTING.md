@@ -1,11 +1,11 @@
 # Adapting agenthuman-ux to your project
 
-This works for anything Claude should act on for a signed-in person: a
+This works for anything an AI chat app should act on for a signed-in person: a
 product, an internal tool, a side project, an existing API you want to expose.
 Everything you change is in `src/project/`; `src/mcp-kit/` stays as-is.
 
-Worked example below: a store, where Claude can search products, build a cart,
-and check orders for the signed-in customer ("Shop via Claude").
+Worked example below: a store, where the AI can search products, build a cart,
+and check orders for the signed-in customer ("shop from ChatGPT or Claude").
 
 ## 1. Brand it → name, favicon, colour
 
@@ -28,7 +28,7 @@ export const BRANDING: Branding = {
 - The `BRAND_*` env vars let one codebase run under several brands without
   code changes (see `.env.example`).
 
-## 2. Decide what Claude may do → scopes
+## 2. Decide what the AI may do → scopes
 
 `src/project/scopes.ts`
 
@@ -43,7 +43,7 @@ export const SCOPES = {
 The consent page lists these strings, so write them for the user. Keep anything
 that moves money or can't be undone behind its own scope. For anything risky,
 the StellaBox pattern is good: the tool returns `approval_required` with an id,
-the user approves in your app, and Claude polls `get_approval`.
+the user approves in your app, and the AI polls `get_approval`.
 
 ## 3. Plug in your login
 
@@ -111,9 +111,9 @@ Rules that keep it safe:
 - **Always scope queries by `context.userId`.** An id from the model must never
   reach another user's data (see `delete_note` in `tools/notes.ts`).
 - **Return error codes, don't throw.** `result({ code: "out_of_stock" }, true)`
-  lets Claude explain the problem and try something else.
+  lets the AI explain the problem and try something else.
 - **Write descriptions for the model.** Say when to use the tool and what each
-  argument means. That text is how Claude chooses.
+  argument means. That text is how the AI chooses.
 - **Mark hints.** `readOnlyHint` for reads, `destructiveHint` for deletes and
   payments, so clients can ask the user before running them.
 - **Keep tools few and task-shaped** ("add_to_cart"), not one per REST endpoint.
@@ -128,14 +128,14 @@ const mcp = createMcpKit({...});              // in app.ts
 await mcp.provider.revokeConnection(connectionId, userId);
 ```
 
-That revokes every token for that connection; Claude's next call gets 401.
+That revokes every token for that connection; the AI app's next call gets 401.
 
 ## 7. Deploy
 
 - Any Node host (Render, Fly, Railway). Set `PUBLIC_API_URL` to the exact public
   origin. It is the OAuth issuer, and tokens are bound to `${PUBLIC_API_URL}/mcp`,
   so a wrong value breaks sign-in.
-- HTTPS is required for Claude. The session cookie turns `Secure` on
+- Every web AI chat app requires HTTPS. The session cookie turns `Secure` on
   automatically when `PUBLIC_API_URL` starts with `https://`.
 - `trust proxy` is already on for hosts that terminate TLS at a proxy.
 - Run `pnpm db:migrate` on deploy.
@@ -149,4 +149,4 @@ That revokes every token for that connection; Claude's next call gets 401.
 - [ ] Users can see and revoke connections
 - [ ] `pnpm e2e` passes against staging (`BASE_URL=https://staging… pnpm e2e`,
       after adapting the login step in the script)
-- [ ] Tested in Claude via Settings → Connectors
+- [ ] Tested in each AI app you support (see the README's "Connect it" table)

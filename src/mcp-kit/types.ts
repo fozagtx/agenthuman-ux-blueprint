@@ -40,4 +40,9 @@ export interface McpKitOptions {
   registerTools: (server: McpServer, db: Database) => void;
   /** MCP server id/version reported to clients, e.g. { name: "my-app", version: "1.0.0" }. */
   serverInfo: { name: string; version: string };
+  /**
+   * Dev/test only: accept http://localhost client metadata URLs (CIMD) so the
+   * e2e script can act as a CIMD client. Never enable in production.
+   */
+  allowLoopbackClientMetadata?: boolean;
 }

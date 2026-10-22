@@ -13,7 +13,7 @@ import { registerNoteTools } from "./notes.js";
  *   3. logTool(...) and return result(...)
  *
  * Write descriptions for the model: say what the tool does, when to use it,
- * and what each argument means. That text is how Claude picks tools.
+ * and what each argument means. That text is how the AI picks tools.
  */
 export function registerTools(server: McpServer, db: Database) {
   registerAccountTools(server, db);

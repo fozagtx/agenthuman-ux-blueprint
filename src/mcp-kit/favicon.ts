@@ -16,7 +16,7 @@ export function faviconMimeType(path: string) {
 }
 
 /**
- * Serves the branded icon at /favicon.ico (what Claude and browsers look up
+ * Serves the branded icon at /favicon.ico (what browsers and connector UIs look up
  * by default) and at /favicon.<ext> (what the MCP server's `icons` points to).
  * The file is read once at startup so a bad path fails fast.
  */
@@ -25,7 +25,13 @@ export function createFaviconRouter(branding: Branding) {
   const body = readFileSync(branding.faviconPath);
   const router = Router();
   const send = (_request: unknown, response: import("express").Response) => {
-    response.set("Content-Type", type).set("Cache-Control", "public, max-age=86400").send(body);
+    response
+      .set("Content-Type", type)
+      .set("Cache-Control", "public, max-age=86400")
+      // An SVG opened directly is a document on our origin; never let it run script.
+      .set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
+      .set("X-Content-Type-Options", "nosniff")
+      .send(body);
   };
   router.get("/favicon.ico", send);
   router.get(`/favicon${extname(branding.faviconPath).toLowerCase()}`, send);

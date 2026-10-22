@@ -2,7 +2,8 @@ import { and, desc, eq } from "drizzle-orm";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v4";
 import type { Database } from "../../db/client.js";
-import { logTool, resolveToolContext, result } from "../../mcp-kit/index.js";
+import { logTool, result } from "../../mcp-kit/index.js";
+import { toolContext } from "./context.js";
 import { notes } from "../schema.js";
 
 /** Example tools: one read, one write, one destructive. Replace with yours. */
@@ -16,7 +17,7 @@ export function registerNoteTools(server: McpServer, db: Database) {
       annotations: { readOnlyHint: true },
     },
     async (args, extra) => {
-      const { context, error } = await resolveToolContext(db, extra.authInfo, "notes:read");
+      const { context, error } = await toolContext(db, extra.authInfo, "notes:read");
       if (error) return result(error, true);
       const rows = await db
         .select({ id: notes.id, title: notes.title, body: notes.body, createdAt: notes.createdAt })
@@ -40,7 +41,7 @@ export function registerNoteTools(server: McpServer, db: Database) {
       },
     },
     async (args, extra) => {
-      const { context, error } = await resolveToolContext(db, extra.authInfo, "notes:write");
+      const { context, error } = await toolContext(db, extra.authInfo, "notes:write");
       if (error) return result(error, true);
       const [note] = await db
         .insert(notes)
@@ -60,7 +61,7 @@ export function registerNoteTools(server: McpServer, db: Database) {
       annotations: { destructiveHint: true },
     },
     async (args, extra) => {
-      const { context, error } = await resolveToolContext(db, extra.authInfo, "notes:write");
+      const { context, error } = await toolContext(db, extra.authInfo, "notes:write");
       if (error) return result(error, true);
       // Always filter by userId: an id alone must never reach another user's data.
       const [deleted] = await db

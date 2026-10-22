@@ -42,11 +42,17 @@ export const connections = pgTable(
 
 // OAuth 2.1 state. Codes and tokens are stored as SHA-256 hashes only.
 
+/**
+ * Every client that has signed in. `id` is either a random id from /register
+ * (DCR) or the client's metadata URL (CIMD); for CIMD clients the fetched
+ * document is cached here and refreshed when `metadataFetchedAt` is stale.
+ */
 export const oauthClients = pgTable("oauth_clients", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
   redirectUris: text("redirect_uris").array().notNull(),
   metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull(),
+  metadataFetchedAt: timestamp("metadata_fetched_at", { withTimezone: true }),
   registeredAt: createdAt(),
 });
 

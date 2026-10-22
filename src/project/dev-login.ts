@@ -1,6 +1,6 @@
 import express, { Router } from "express";
 import type { Database } from "../db/client.js";
-import { escapeHtml, page, type Branding, type Session } from "../mcp-kit/index.js";
+import { escapeHtml, page, sendPage, type Branding, type Session } from "../mcp-kit/index.js";
 import { users } from "./schema.js";
 import { safeNext } from "./session.js";
 
@@ -14,7 +14,8 @@ export function createDevLoginRouter(db: Database, session: Session, branding: B
 
   router.get("/login", (request, response) => {
     const next = escapeHtml(safeNext(request.query.next));
-    response.send(
+    sendPage(
+      response,
       page(
         branding,
         "Sign in",
@@ -33,7 +34,7 @@ export function createDevLoginRouter(db: Database, session: Session, branding: B
     try {
       const email = String(request.body?.email ?? "").trim().toLowerCase();
       if (!/^[^\s@]+@[^\s@]+$/.test(email)) {
-        response.status(400).send(page(branding, "Sign in", `<h1>Enter a valid email</h1>`));
+        sendPage(response, page(branding, "Sign in", `<h1>Enter a valid email</h1>`), 400);
         return;
       }
       const [user] = await db

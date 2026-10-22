@@ -52,7 +52,7 @@ export function createCookieSession(secret: string, secure: boolean): Session {
       response.cookie(COOKIE, value, {
         httpOnly: true,
         secure,
-        // Lax: the cookie still rides along when Claude redirects the user to
+        // Lax: the cookie still rides along when the AI app redirects the user to
         // /connect, but not on cross-site POSTs, so nobody can forge consent.
         sameSite: "lax",
         maxAge: MAX_AGE_SECONDS * 1000,
